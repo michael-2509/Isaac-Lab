@@ -48,13 +48,13 @@ class GeometricController:
         self.device = device
         
         # Controller gains (tuned for Crazyflie-like scale)
-        # Position/Velocity gains - FURTHER REDUCED for smooth tracking
-        self.kv = torch.tensor([0.5, 0.5, 1.0], device=device)  # FIX #1: Reduced from [0.8, 0.8, 1.2] for smoother motion
+        # Position/Velocity gains - REDUCED to prevent thrust saturation
+        self.kv = torch.tensor([0.8, 0.8, 1.2], device=device)  # FIX #1: Reduced from [2.0, 2.0, 1.0]
         self.kp = torch.tensor([5.0, 5.0, 5.0], device=device)  # Position error gain (unused in vel mode)
         
-        # Attitude gains - REDUCED for less aggressive corrections
-        self.kR = torch.tensor([1500.0, 1500.0, 150.0], device=device) * self.cfg.moment_scale  # FIX: Reduced from 3000/200
-        self.kw = torch.tensor([150.0, 150.0, 40.0], device=device) * self.cfg.moment_scale    # FIX: Reduced from 200/50
+        # Attitude gains
+        self.kR = torch.tensor([3000.0, 3000.0, 200.0], device=device) * self.cfg.moment_scale  # Rotation matrix error gain
+        self.kw = torch.tensor([200.0, 200.0, 50.0], device=device) * self.cfg.moment_scale    # Angular velocity error gain
         
         # Gravity vector
         self.g = torch.tensor([0.0, 0.0, 9.81], device=device)
@@ -95,14 +95,10 @@ class GeometricController:
         # Desired acceleration
         acc_des = self.kv * vel_error + self.g
         
-        # Add damping to reduce oscillations (smooth out aggressive corrections)
-        damping_factor = 0.95  # Slightly reduce commanded acceleration
-        acc_des = acc_des * damping_factor
-        
         # Desired force vector (F = ma)
         # Clamp acceleration to realistic limits to avoid instability
         acc_des_norm = torch.norm(acc_des, dim=1, keepdim=True)
-        max_acc = 15.0 # m/s^2 limit (reduced from 20.0 for smoother motion)
+        max_acc = 20.0 # m/s^2 limit
         acc_des = torch.where(acc_des_norm > max_acc, acc_des * (max_acc / acc_des_norm), acc_des)
         
         F_des = acc_des * self.robot_mass
@@ -213,8 +209,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     ui_window_class_type = QuadcopterEnvWindow
 
     # === CONTROLLER LIMITS ===
-    max_target_velocity: float = 0.3  # m/s (reduced from 0.5 for smoother motion, less overshooting)
-    max_target_yaw_rate: float = 0.8  # rad/s (reduced from 1.0 for smoother turns)
+    max_target_velocity: float = 0.5  # m/s (reduced from 1.5 for stability)
+    max_target_yaw_rate: float = 1.0  # rad/s (reduced from 2.0 for stability)
 
     # Physics simulation
     sim: SimulationCfg = SimulationCfg(
@@ -285,12 +281,12 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     obstacle_collision_radius: float = 0.5  # Collision detection radius
     # === REWARD SCALING ===
     # Priority-based reward structure: survival > stability > goal reaching > smooth motion
-    alive_reward_scale: float = 2.0       # Per-step reward for staying alive
-    upright_reward_scale: float = 10.0    # Reward for staying level (increased from 8.0 to prioritize stability)
-    distance_to_goal_scale: float = 3.0   # Dense reward for approaching goal (increased from 2.0 now that hover works)
-    collision_penalty_scale: float = 5.0   # Collision penalty
-    velocity_penalty_scale: float = 0.3   # Penalize excessive velocity (increased from 0.1 to encourage gentler motion)
-    acceleration_penalty_scale: float = 0.008  # Slightly increased from 0.005 to discourage jerky motion
+    alive_reward_scale: float = 2.0       # Per-step reward for staying alive (increased to 2.0)
+    upright_reward_scale: float = 8.0     # Reward for staying level (boosted: #1 priority for hover learning)
+    distance_to_goal_scale: float = 2.0   # Dense reward for approaching goal (reduced from 15.0 to prioritize stability)
+    collision_penalty_scale: float = 5.0   # Collision penalty (reduced from 10.0, less harsh early)
+    velocity_penalty_scale: float = 0.1   # Penalize excessive velocity (small factor)
+    acceleration_penalty_scale: float = 0.005  # FIX #5: Reduced from 0.01 (allow jerky motion during learning)
 
 
 class QuadcopterEnv(DirectRLEnv):
@@ -430,13 +426,13 @@ class QuadcopterEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         """Get observation vector for policy.
         
-        Observation includes:
-        - Linear velocity in body frame (3)
-        - Angular velocity in body frame (3)
-        - Projected gravity in body frame (3)
-        - Relative goal position in body frame (3)
-        - Distance to goal (1)
-        - LiDAR distances in 6 directions (6)
+        Observation includes (all normalized to similar scales):
+        - Linear velocity in body frame (3) - normalized to ~[-1, 1]
+        - Angular velocity in body frame (3) - normalized to ~[-1, 1]
+        - Projected gravity in body frame (3) - already normalized
+        - Relative goal position in body frame (3) - normalized to ~[-1, 1]
+        - Distance to goal (1) - normalized to [0, 1]
+        - LiDAR distances in 6 directions (6) - already normalized
         Total: 19 dimensions
         """
         # Relative goal position in body frame
@@ -451,15 +447,16 @@ class QuadcopterEnv(DirectRLEnv):
         # LiDAR-like obstacle detection (simplified)
         lidar_obs = self._compute_lidar_observations()
         
-        # Construct full observation
+        # MANUAL NORMALIZATION: Scale all observations to similar ranges [-1, 1] or [0, 1]
+        # This helps the neural network learn faster by putting all inputs on the same scale
         obs = torch.cat(
             [
-                self._robot.data.root_lin_vel_b,  # (3)
-                self._robot.data.root_ang_vel_b,  # (3)
-                self._robot.data.projected_gravity_b,  # (3)
-                desired_pos_b,  # (3)
-                distance_to_goal_normalized,  # (1)
-                lidar_obs,  # (6)
+                self._robot.data.root_lin_vel_b / 2.0,        # (3) Normalize: max expected ~2 m/s
+                self._robot.data.root_ang_vel_b / 10.0,       # (3) Normalize: max expected ~10 rad/s
+                self._robot.data.projected_gravity_b,         # (3) Already normalized
+                desired_pos_b / 5.0,                          # (3) Normalize: max distance ~5m
+                distance_to_goal_normalized,                  # (1) Already normalized
+                lidar_obs,                                    # (6) Already normalized
             ],
             dim=-1,
         )
