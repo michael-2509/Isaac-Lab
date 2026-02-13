@@ -5,7 +5,9 @@
 
 """
 GPS-Denied Autonomous Navigation Environment for Quadcopter.
-Uses hierarchical control with RL-based policy, targeting real-world deployment.
+Uses hierarchical control with RL-based policy acting as a high-level planner.
+The RL agent commands desired velocities (vx, vy, vz) and yaw rate, while a
+low-level Geometric Controller handles attitude and thrust to achieve these targets.
 """
 
 from __future__ import annotations
@@ -23,13 +25,155 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import subtract_frame_transforms, quat_rotate
+from isaaclab.utils.math import subtract_frame_transforms, quat_rotate, quat_from_matrix
 
 ##
 # Pre-defined configs
 ##
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 from isaaclab.markers import CUBOID_MARKER_CFG, SPHERE_MARKER_CFG  # isort: skip
+
+
+
+class GeometricController:
+    """Geometric tracking controller for quadcopter on SE(3).
+    
+    Converts desired velocity/yaw targets into thrust and body torques.
+    Reference: Lee et al., "Geometric tracking control of a quadrotor UAV on SE(3)"
+    """
+    
+    def __init__(self, cfg: QuadcopterEnvCfg, num_envs: int, device: str):
+        self.cfg = cfg
+        self.num_envs = num_envs
+        self.device = device
+        
+        # Controller gains (tuned for Crazyflie-like scale)
+        # Position/Velocity gains - REDUCED to prevent thrust saturation
+        self.kv = torch.tensor([0.8, 0.8, 1.2], device=device)  # Velocity error gain (gentler xy, stronger z)
+        self.kp = torch.tensor([5.0, 5.0, 5.0], device=device)  # Position error gain (unused in vel mode)
+        
+        # Attitude gains
+        self.kR = torch.tensor([3000.0, 3000.0, 200.0], device=device) * self.cfg.moment_scale  # Rotation matrix error gain
+        self.kw = torch.tensor([200.0, 200.0, 50.0], device=device) * self.cfg.moment_scale    # Angular velocity error gain
+        
+        # Gravity vector
+        self.g = torch.tensor([0.0, 0.0, 9.81], device=device)
+        self.robot_mass = 0.028  # Approximate Crazyflie mass (overwritten in env init)
+        self.robot_weight = self.robot_mass * 9.81 # W = mg
+
+    def compute_control(self, 
+                        curr_pos: torch.Tensor, 
+                        curr_vel: torch.Tensor, 
+                        curr_quat: torch.Tensor, 
+                        curr_ang_vel: torch.Tensor, 
+                        target_vel: torch.Tensor, 
+                        target_yaw_rate: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute control inputs (thrust, moments) to track target velocity and yaw rate.
+        
+        Args:
+            curr_pos: (num_envs, 3) Current position in world frame
+            curr_vel: (num_envs, 3) Current linear velocity in world frame
+            curr_quat: (num_envs, 4) Current orientation (w, x, y, z)
+            curr_ang_vel: (num_envs, 3) Current angular velocity in body frame
+            target_vel: (num_envs, 3) Desired linear velocity in world frame
+            target_yaw_rate: (num_envs, 1) Desired yaw rate
+            
+        Returns:
+            thrust: (num_envs, 1, 3) Computed thrust force vector
+            moments: (num_envs, 1, 3) Computed body torque vector
+        """
+        
+        # 1. Compute Desired Force Vector (in World Frame)
+        # error_v = v_des - v_curr
+        # F_des = m * (g + K_v * error_v)
+        
+        # Velocity error
+        # target_vel is in world frame (from policy)
+        vel_error = target_vel - curr_vel
+        
+        # Desired acceleration
+        acc_des = self.kv * vel_error + self.g
+        
+        # Desired force vector (F = ma)
+        # Clamp acceleration to realistic limits to avoid instability
+        acc_des_norm = torch.norm(acc_des, dim=1, keepdim=True)
+        max_acc = 20.0 # m/s^2 limit
+        acc_des = torch.where(acc_des_norm > max_acc, acc_des * (max_acc / acc_des_norm), acc_des)
+        
+        F_des = acc_des * self.robot_mass
+        
+        # 2. Compute Desired Attitude (Rotation Matrix)
+        # The body z-axis (b3) should align with F_des
+        b3_des = F_des / torch.norm(F_des, dim=1, keepdim=True)
+        
+        # Current rotation matrix R
+        # quat is (w, x, y, z) in Isaac Lab
+        w, x, y, z = curr_quat.unbind(-1)
+        R_curr = torch.stack([
+            1 - 2*y**2 - 2*z**2, 2*x*y - 2*z*w,     2*x*z + 2*y*w,
+            2*x*y + 2*z*w,     1 - 2*x**2 - 2*z**2, 2*y*z - 2*x*w,
+            2*x*z - 2*y*w,     2*y*z + 2*x*w,     1 - 2*x**2 - 2*y**2
+        ], dim=-1).reshape(self.num_envs, 3, 3)
+        
+        # 3. Compute Thrust Magnitude
+        # Project desired force onto CURRENT body z-axis
+        b3_curr = R_curr[:, :, 2]
+        thrust_mag = torch.sum(F_des * b3_curr, dim=1, keepdim=True)
+        # Clamp thrust to legitimate physical limits (0 to ~2.5x weight)
+        # Dynamic clamping based on actual robot weight
+        max_thrust = 2.5 * self.robot_weight
+        thrust_mag = torch.clamp(thrust_mag, 0.0, max_thrust)
+        
+        thrust_vec = torch.zeros_like(F_des)
+        thrust_vec[:, 2] = thrust_mag.squeeze(-1) # Force in body frame (z-axis)
+        
+        # 4. Compute Moments
+        # We need to rotate b3_curr to b3_des
+        # Cross product gives the axis of rotation needed
+        
+        # Rotation error vector (e_R)
+        # e_R = 1/2 * (R_des.T * R - R.T * R_des)_vee ... standard geometric control
+        # Simplified:
+        # Target z-axis is b3_des. Current is b3_curr.
+        # Orientation error to align z-axes:
+        z_error = torch.linalg.cross(b3_curr, b3_des)
+        
+        # Rotate error to body frame!
+        # z_error is in World Frame (because b3_curr and b3_des are World Frame vectors)
+        # We need torque in Body Frame.
+        # R_curr maps Body -> World. R_curr.T maps World -> Body.
+        z_error_b = torch.matmul(R_curr.transpose(-2, -1), z_error.unsqueeze(-1)).squeeze(-1)
+        
+        # Yaw control:
+        # We want angular velocity z component to match target_yaw_rate
+        # We don't enforce a specific heading (yaw angle) because it's relative
+        # So we just add a P-term on yaw rate error to the moment
+        
+        # Construct e_R (approximate)
+        # The cross product z_error captures pitch/roll error
+        e_R = z_error_b
+        
+        # Angular velocity error
+        # We want body rates w_x, w_y to correct attitude, w_z to track yaw rate
+        # Target w_z = target_yaw_rate
+        # Target w_x, w_y = 0 (stabilize)
+        
+        target_ang_vel = torch.zeros_like(curr_ang_vel)
+        target_ang_vel[:, 2] = target_yaw_rate.squeeze(-1)
+        
+        ang_vel_error = curr_ang_vel - target_ang_vel
+        
+        # Compute Moments
+        # We separate tilt (roll/pitch) from yaw
+        moments = -self.kR * e_R - self.kw * ang_vel_error
+        
+        # Clamp moments to avoid instability
+        # For Crazyflie scale: Ixx ≈ 1.4e-5 kg⋅m², max angular accel ≈ 3000 rad/s²
+        # Max torque ≈ 0.042 Nm. Use 0.5 Nm as safe upper bound (allows aggressive recovery)
+        moments = torch.clamp(moments, -0.5, 0.5)
+        
+        return thrust_vec.unsqueeze(1), moments.unsqueeze(1)
 
 
 class QuadcopterEnvWindow(BaseEnvWindow):
@@ -56,13 +200,17 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     # Environment settings
     episode_length_s: float = 10.0
     decimation: int = 2
-    action_space: int = 4  # 4D thrust commands
+    action_space: int = 4  # (vx, vy, vz, yaw_rate)
     # Observation: lin_vel(3) + ang_vel(3) + gravity(3) + rel_goal(3) + goal_dist(1) + lidar_6(6) = 19
     observation_space: int = 19
     state_space: int = 0
     debug_vis: bool = True
 
     ui_window_class_type = QuadcopterEnvWindow
+
+    # === CONTROLLER LIMITS ===
+    max_target_velocity: float = 0.5  # m/s (reduced from 1.5 for stability)
+    max_target_yaw_rate: float = 1.0  # rad/s (reduced from 2.0 for stability)
 
     # Physics simulation
     sim: SimulationCfg = SimulationCfg(
@@ -99,7 +247,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     # Robot configuration
     robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     thrust_to_weight: float = 1.9
-    moment_scale: float = 0.01
+    moment_scale: float = 0.1  # Increased from 0.01 to give controller more attitude authority
 
     # === SENSOR PARAMETERS ===
     # LiDAR / Depth sensor (simplified to 6-direction raycasting)
@@ -121,29 +269,24 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     # === CONSTRAINT LIMITS ===
     max_velocity: float = 2.0  # m/s
     max_acceleration: float = 5.0  # m/s^2
-    min_altitude: float = 0.1  # m
-    max_altitude: float = 2.0  # m
-    max_tilt_angle: float = 0.785  # rad (45 degrees)
+    min_altitude: float = 0.05  # m (relaxed from 0.1 for learning)
+    max_altitude: float = 3.0  # m (relaxed from 2.0 for headroom)
+    max_tilt_angle: float = 1.5  # rad (~85 degrees, relaxed for recovery)
 
     # === OBSTACLE PARAMETERS ===
-    num_obstacles: int = 4
+    num_obstacles: int = 0  # DISABLED for Phase 1: Learn hovering first
     obstacle_radius_range: tuple = (0.1, 0.3)  # (min, max) radius
     obstacle_height_range: tuple = (0.5, 1.8)  # (min, max) height for obstacles (m)
     obstacle_speed_range: tuple = (0.0, 0.5)  # (min, max) linear velocity
     obstacle_collision_radius: float = 0.5  # Collision detection radius
-
     # === REWARD SCALING ===
-    # Priority-based reward structure for stability and realism
-    distance_to_goal_scale: float = 15.0  # Dense reward for approaching goal
-    collision_penalty_scale: float = 10.0  # Large penalty for collisions
-    velocity_penalty_scale: float = -0.05  # Penalize excessive velocity
-    acceleration_penalty_scale: float = -0.02  # Penalize jerky motions
-    orientation_penalty_scale: float = -0.01  # Reward upright orientation
-    
-    # Simplified reward scales (for compatibility with quadcopter_env_main)
-    lin_vel_reward_scale: float = -0.05
-    ang_vel_reward_scale: float = -0.01
-    distance_to_goal_reward_scale: float = 15.0
+    # Priority-based reward structure: survival > stability > goal reaching > smooth motion
+    alive_reward_scale: float = 2.0       # Per-step reward for staying alive (increased to 2.0)
+    upright_reward_scale: float = 8.0     # Reward for staying level (boosted: #1 priority for hover learning)
+    distance_to_goal_scale: float = 2.0   # Dense reward for approaching goal (reduced from 15.0 to prioritize stability)
+    collision_penalty_scale: float = 5.0   # Collision penalty (reduced from 10.0, less harsh early)
+    velocity_penalty_scale: float = 0.1   # Penalize excessive velocity (small factor)
+    acceleration_penalty_scale: float = 0.01  # DISABLED: was punishing recovery thrust, re-enable after hover learned
 
 
 class QuadcopterEnv(DirectRLEnv):
@@ -158,6 +301,9 @@ class QuadcopterEnv(DirectRLEnv):
         self._actions = torch.zeros(self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device)
         self._thrust = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self._moment = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        
+        # Initialize Geometric Controller
+        self.controller = GeometricController(self.cfg, self.num_envs, self.device)
         
         # Goal position (world frame)
         self._desired_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
@@ -185,11 +331,12 @@ class QuadcopterEnv(DirectRLEnv):
         self._episode_sums = {
             key: torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
             for key in [
+                "alive",
+                "upright",
                 "distance_to_goal",
                 "collision_penalty",
                 "velocity_penalty",
                 "acceleration_penalty",
-                "orientation_penalty",
             ]
         }
         
@@ -198,6 +345,14 @@ class QuadcopterEnv(DirectRLEnv):
         self._robot_mass = self._robot.root_physx_view.get_masses()[0].sum()
         self._gravity_magnitude = torch.tensor(self.sim.cfg.gravity, device=self.device).norm()
         self._robot_weight = (self._robot_mass * self._gravity_magnitude).item()
+        
+        # Update Controller Mass
+        self.controller.robot_mass = self._robot_mass.item()
+        self.controller.robot_weight = self._robot_weight
+
+        print(f"[QuadcopterEnv] Robot Mass: {self._robot_mass.item():.4f} kg")
+        print(f"[QuadcopterEnv] Robot Weight: {self._robot_weight:.4f} N")
+        print(f"[QuadcopterEnv] Max Thrust (Clamped): {2.5 * self._robot_weight:.4f} N")
 
         self.set_debug_vis(self.cfg.debug_vis)
 
@@ -220,23 +375,41 @@ class QuadcopterEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        """Apply actions before physics step."""
+        """Apply actions before physics step.
+        
+        Actions are now high-level commands: [target_vx, target_vy, target_vz, target_yaw_rate]
+        The Geometric Controller converts these to thrust and moments.
+        """
         self._actions = actions.clone().clamp(-1.0, 1.0)
         
-        # Convert normalized action to thrust
-        # Action[0]: throttle (0 to full thrust)
-        # Action[1:4]: roll, pitch, yaw rates
-        self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * (self._actions[:, 0] + 1.0) / 2.0
-        self._moment[:, 0, :] = self.cfg.moment_scale * self._actions[:, 1:]
+        # Interpret actions as velocity targets
+        # actions[0:3]: target velocity (vx, vy, vz) in world frame, scale to max limits
+        # actions[3]: target yaw rate
+        target_vel = self._actions[:, :3] * self.cfg.max_target_velocity
+        target_yaw_rate = self._actions[:, 3:4] * self.cfg.max_target_yaw_rate
         
-        # Update wind disturbance
-        self._update_wind_disturbance()
+        # Get current state
+        curr_pos = self._robot.data.root_pos_w
+        curr_vel = self._robot.data.root_lin_vel_w  # World frame velocity for controller
+        curr_quat = self._robot.data.root_quat_w
+        curr_ang_vel = self._robot.data.root_ang_vel_b
+        
+        # Compute Low-Level Control
+        thrust, moments = self.controller.compute_control(
+            curr_pos, curr_vel, curr_quat, curr_ang_vel, target_vel, target_yaw_rate
+        )
+        
+        self._thrust = thrust
+        self._moment = moments
+        
+        # Update wind disturbance (DISABLED for stability baseline)
+        # self._update_wind_disturbance()
         
         # Update obstacle positions (circular trajectories)
         self._update_obstacles()
         
-        # Update VIO error (cumulative drift)
-        self._update_vio_error()
+        # Update VIO error (cumulative drift) (DISABLED for stability baseline)
+        # self._update_vio_error()
 
     def _apply_action(self):
         """Apply computed forces and torques to the robot."""
@@ -244,11 +417,11 @@ class QuadcopterEnv(DirectRLEnv):
             body_ids=self._body_id, forces=self._thrust, torques=self._moment
         )
         
-        # Apply wind disturbance
-        if self.cfg.wind_enabled:
-            self._robot.permanent_wrench_composer.set_forces_and_torques(
-                body_ids=self._body_id, forces=self._wind_force.unsqueeze(1)
-            )
+        # Apply wind disturbance (DISABLED for stability baseline)
+        # if self.cfg.wind_enabled:
+        #     self._robot.permanent_wrench_composer.set_forces_and_torques(
+        #         body_ids=self._body_id, forces=self._wind_force.unsqueeze(1)
+        #     )
 
     def _get_observations(self) -> dict:
         """Get observation vector for policy.
@@ -287,25 +460,26 @@ class QuadcopterEnv(DirectRLEnv):
             dim=-1,
         )
         
+        # Verify and handle numerical issues (NaNs/Infs) due to potential physics instability
+        if torch.isnan(obs).any() or torch.isinf(obs).any():
+            # Replace NaNs with 0 and Infs with finite values
+            obs = torch.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0)
+            
         return {"policy": obs}
 
     def _compute_lidar_observations(self) -> torch.Tensor:
-        """Compute simplified 6-direction LiDAR observations in body frame.
-        
-        Returns normalized distances (0-1, where 1 = max_range) in directions:
-        [forward, back, left, right, up, down]
-        """
+        """Compute simplified LiDAR observations (6 directions)."""
+        distances = torch.ones(self.num_envs, 6, device=self.device) * self.cfg.lidar_range_max
         max_range = self.cfg.lidar_range_max
-        distances = torch.full((self.num_envs, 6), max_range, dtype=torch.float32, device=self.device)
+        
+        # Check specific obstacle distances (simplified ray casting)
+        # We calculate vector to each obstacle, project onto 6 axes
         
         for obs_idx in range(self.cfg.num_obstacles):
-            # Relative position in world frame
+            # Vector to obstacle in body frame
             rel_pos_w = self._obstacle_pos_w[:, obs_idx, :] - self._robot.data.root_pos_w
-            
-            # Transform to body frame
-            rel_pos_b = quat_rotate(
-                torch.cat([self._robot.data.root_quat_w[:, [3]], self._robot.data.root_quat_w[:, :3]], dim=-1),
-                rel_pos_w
+            rel_pos_b, _ = subtract_frame_transforms(
+                torch.zeros_like(rel_pos_w), self._robot.data.root_quat_w, rel_pos_w
             )
             
             # Euclidean distance
@@ -325,22 +499,32 @@ class QuadcopterEnv(DirectRLEnv):
             distances[:, 4] = torch.minimum(distances[:, 4], torch.where(rel_pos_b[:, 2] > 0, dist, torch.tensor(max_range, device=self.device)))  # up
             distances[:, 5] = torch.minimum(distances[:, 5], torch.where(rel_pos_b[:, 2] < 0, dist, torch.tensor(max_range, device=self.device)))  # down
         
-        # Normalize to [0, 1] and add noise
+        # Normalize to [0, 1] (noise DISABLED for stability baseline)
         normalized_distances = distances / max_range
-        noise = torch.randn_like(normalized_distances) * self.cfg.lidar_noise_std
-        normalized_distances = torch.clamp(normalized_distances + noise, 0, 1)
+        # noise = torch.randn_like(normalized_distances) * self.cfg.lidar_noise_std
+        # normalized_distances = torch.clamp(normalized_distances + noise, 0, 1)
+        normalized_distances = torch.clamp(normalized_distances, 0, 1)
         
         return normalized_distances
 
     def _get_rewards(self) -> torch.Tensor:
-        """Compute reward based on priority: goal reaching > collision avoidance > smooth motion."""
+        """Compute reward based on priority: survival > stability > goal reaching > smooth motion."""
         
-        # 1. Distance to goal (primary objective - dense reward)
+        # 1. ALIVE REWARD (survival bonus - most important early signal)
+        alive_reward = torch.ones(self.num_envs, device=self.device) * self.cfg.alive_reward_scale * self.step_dt
+        
+        # 2. UPRIGHT REWARD (positive framing: reward being level)
+        # When perfectly upright: projected_gravity_b = (0, 0, -1), so z = -1
+        # -z gives 1.0 when upright, -1.0 when inverted
+        upright = -self._robot.data.projected_gravity_b[:, 2]
+        upright_reward = torch.clamp(upright, 0, 1) * self.cfg.upright_reward_scale * self.step_dt
+        
+        # 3. Distance to goal (primary navigation objective - dense reward)
         distance_to_goal = torch.linalg.norm(self._desired_pos_w - self._robot.data.root_pos_w, dim=1)
         # Smooth mapping: closer = higher reward, asymptotic at goal
         distance_to_goal_reward = (1.0 - torch.tanh(distance_to_goal / 0.8)) * self.cfg.distance_to_goal_scale * self.step_dt
         
-        # 2. Collision penalty (secondary objective - large penalty)
+        # 4. Collision penalty
         collision_penalty = torch.zeros(self.num_envs, device=self.device)
         for obs_idx in range(self.cfg.num_obstacles):
             rel_pos_w = self._obstacle_pos_w[:, obs_idx, :] - self._robot.data.root_pos_w
@@ -354,36 +538,37 @@ class QuadcopterEnv(DirectRLEnv):
             )
             self._in_collision = torch.logical_or(self._in_collision, collision_mask)
         
-        # 3. Velocity penalty (penalize excessive speed)
+        # 5. Velocity penalty (penalize excessive speed)
         lin_vel_magnitude = torch.linalg.norm(self._robot.data.root_lin_vel_b, dim=1)
         velocity_penalty = torch.clamp(lin_vel_magnitude - self.cfg.max_velocity, 0) * self.cfg.velocity_penalty_scale * self.step_dt
         
-        # 4. Acceleration penalty (promote smooth motion)
+        # 6. Acceleration penalty (promote smooth motion)
         lin_acc_b = (self._robot.data.root_lin_vel_b - self._prev_lin_vel_b) / self.step_dt
         lin_acc_magnitude = torch.linalg.norm(lin_acc_b, dim=1)
         acceleration_penalty = lin_acc_magnitude * self.cfg.acceleration_penalty_scale * self.step_dt
         
-        # 5. Orientation penalty (encourage upright configuration)
-        # Projected gravity should point downward (0, 0, -1) in body frame
-        # Penalize if gravity is tilted significantly
-        gravity_direction_error = torch.linalg.norm(self._robot.data.projected_gravity_b[:, :2], dim=1)
-        orientation_penalty = gravity_direction_error * self.cfg.orientation_penalty_scale * self.step_dt
-        
-        # Combine rewards
+        # Combine rewards (positive rewards + negative penalties)
         rewards = {
+            "alive": alive_reward,
+            "upright": upright_reward,
             "distance_to_goal": distance_to_goal_reward,
             "collision": -collision_penalty,
-            "velocity": velocity_penalty,
-            "acceleration": acceleration_penalty,
-            "orientation": orientation_penalty,
+            "velocity": -velocity_penalty,
+            "acceleration": -acceleration_penalty,
         }
         
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
         
         # Log episode sums
-        for key, value in rewards.items():
-            if key in self._episode_sums:
-                self._episode_sums[key] += value
+        self._episode_sums["alive"] += rewards["alive"]
+        self._episode_sums["upright"] += rewards["upright"]
+        self._episode_sums["distance_to_goal"] += rewards["distance_to_goal"]
+        self._episode_sums["collision_penalty"] += rewards["collision"]
+        self._episode_sums["velocity_penalty"] += rewards["velocity"]
+        self._episode_sums["acceleration_penalty"] += rewards["acceleration"]
+        
+        # Update previous velocity for next step's acceleration computation
+        self._prev_lin_vel_b = self._robot.data.root_lin_vel_b.clone()
         
         return reward
 
@@ -399,7 +584,7 @@ class QuadcopterEnv(DirectRLEnv):
         # Tilt constraint (tip over detection)
         # Extract roll and pitch from quaternion (simplified check)
         gravity_error = torch.linalg.norm(self._robot.data.projected_gravity_b[:, :2], dim=1)
-        tipped = gravity_error > 0.9  # > 45 degrees tilt
+        tipped = gravity_error > 1.2  # ~69 degrees tilt (relaxed from 0.9 for recovery time)
         
         died = torch.logical_or(torch.logical_or(below_min, above_max), tipped)
         
@@ -457,6 +642,8 @@ class QuadcopterEnv(DirectRLEnv):
         joint_vel = self._robot.data.default_joint_vel[env_ids]
         default_root_state = self._robot.data.default_root_state[env_ids].clone()
         default_root_state[:, :3] += self._terrain.env_origins[env_ids]
+        # Spawn at safe hover altitude (0.5m) instead of ground level
+        default_root_state[:, 2] = self._terrain.env_origins[env_ids, 2] + 0.5
         
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
@@ -468,6 +655,14 @@ class QuadcopterEnv(DirectRLEnv):
             # Random position in xy plane, fixed height
             xy_pos = torch.rand(len(env_ids), 2, device=self.device) * 4.0 - 2.0
             xy_pos += self._terrain.env_origins[env_ids, :2]
+            
+            # Ensure obstacles are at least 0.8m from spawn origin (safe zone)
+            rel_xy = xy_pos - self._terrain.env_origins[env_ids, :2]
+            dist_from_origin = torch.linalg.norm(rel_xy, dim=1, keepdim=True).clamp(min=0.01)
+            too_close = (dist_from_origin < 0.8).squeeze(-1)
+            if too_close.any():
+                # Push outward to 0.8m minimum distance
+                xy_pos[too_close] = self._terrain.env_origins[env_ids[too_close], :2] + rel_xy[too_close] * (0.8 / dist_from_origin[too_close])
             height = torch.rand(len(env_ids), 1, device=self.device) * (self.cfg.obstacle_height_range[1] - self.cfg.obstacle_height_range[0]) + self.cfg.obstacle_height_range[0]
             
             self._obstacle_pos_w[env_ids, obs_idx, :2] = xy_pos
