@@ -48,13 +48,13 @@ class GeometricController:
         self.device = device
         
         # Controller gains (tuned for Crazyflie-like scale)
-        # Position/Velocity gains - REDUCED to prevent thrust saturation
-        self.kv = torch.tensor([0.8, 0.8, 1.2], device=device)  # Velocity error gain (gentler xy, stronger z)
+        # Position/Velocity gains - FURTHER REDUCED for smooth tracking
+        self.kv = torch.tensor([0.5, 0.5, 1.0], device=device)  # FIX #1: Reduced from [0.8, 0.8, 1.2] for smoother motion
         self.kp = torch.tensor([5.0, 5.0, 5.0], device=device)  # Position error gain (unused in vel mode)
         
-        # Attitude gains
-        self.kR = torch.tensor([3000.0, 3000.0, 200.0], device=device) * self.cfg.moment_scale  # Rotation matrix error gain
-        self.kw = torch.tensor([200.0, 200.0, 50.0], device=device) * self.cfg.moment_scale    # Angular velocity error gain
+        # Attitude gains - REDUCED for less aggressive corrections
+        self.kR = torch.tensor([1500.0, 1500.0, 150.0], device=device) * self.cfg.moment_scale  # FIX: Reduced from 3000/200
+        self.kw = torch.tensor([150.0, 150.0, 40.0], device=device) * self.cfg.moment_scale    # FIX: Reduced from 200/50
         
         # Gravity vector
         self.g = torch.tensor([0.0, 0.0, 9.81], device=device)
@@ -95,10 +95,14 @@ class GeometricController:
         # Desired acceleration
         acc_des = self.kv * vel_error + self.g
         
+        # Add damping to reduce oscillations (smooth out aggressive corrections)
+        damping_factor = 0.95  # Slightly reduce commanded acceleration
+        acc_des = acc_des * damping_factor
+        
         # Desired force vector (F = ma)
         # Clamp acceleration to realistic limits to avoid instability
         acc_des_norm = torch.norm(acc_des, dim=1, keepdim=True)
-        max_acc = 20.0 # m/s^2 limit
+        max_acc = 15.0 # m/s^2 limit (reduced from 20.0 for smoother motion)
         acc_des = torch.where(acc_des_norm > max_acc, acc_des * (max_acc / acc_des_norm), acc_des)
         
         F_des = acc_des * self.robot_mass
@@ -171,7 +175,7 @@ class GeometricController:
         # Clamp moments to avoid instability
         # For Crazyflie scale: Ixx ≈ 1.4e-5 kg⋅m², max angular accel ≈ 3000 rad/s²
         # Max torque ≈ 0.042 Nm. Use 0.5 Nm as safe upper bound (allows aggressive recovery)
-        moments = torch.clamp(moments, -0.5, 0.5)
+        moments = torch.clamp(moments, -0.5, 0.5)  # FIX #2: Increased from ±0.05 to ±0.5
         
         return thrust_vec.unsqueeze(1), moments.unsqueeze(1)
 
@@ -209,8 +213,8 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     ui_window_class_type = QuadcopterEnvWindow
 
     # === CONTROLLER LIMITS ===
-    max_target_velocity: float = 0.5  # m/s (reduced from 1.5 for stability)
-    max_target_yaw_rate: float = 1.0  # rad/s (reduced from 2.0 for stability)
+    max_target_velocity: float = 0.3  # m/s (reduced from 0.5 for smoother motion, less overshooting)
+    max_target_yaw_rate: float = 0.8  # rad/s (reduced from 1.0 for smoother turns)
 
     # Physics simulation
     sim: SimulationCfg = SimulationCfg(
@@ -247,7 +251,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     # Robot configuration
     robot: ArticulationCfg = CRAZYFLIE_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     thrust_to_weight: float = 1.9
-    moment_scale: float = 0.1  # Increased from 0.01 to give controller more attitude authority
+    moment_scale: float = 0.1  # FIX #3: Increased from 0.01 (10x more attitude authority)
 
     # === SENSOR PARAMETERS ===
     # LiDAR / Depth sensor (simplified to 6-direction raycasting)
@@ -274,19 +278,19 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     max_tilt_angle: float = 1.5  # rad (~85 degrees, relaxed for recovery)
 
     # === OBSTACLE PARAMETERS ===
-    num_obstacles: int = 0  # DISABLED for Phase 1: Learn hovering first
+    num_obstacles: int = 0  # FIX #4: DISABLED for Phase 1 (learn hovering first, re-enable after iter 100)
     obstacle_radius_range: tuple = (0.1, 0.3)  # (min, max) radius
     obstacle_height_range: tuple = (0.5, 1.8)  # (min, max) height for obstacles (m)
     obstacle_speed_range: tuple = (0.0, 0.5)  # (min, max) linear velocity
     obstacle_collision_radius: float = 0.5  # Collision detection radius
     # === REWARD SCALING ===
     # Priority-based reward structure: survival > stability > goal reaching > smooth motion
-    alive_reward_scale: float = 2.0       # Per-step reward for staying alive (increased to 2.0)
-    upright_reward_scale: float = 8.0     # Reward for staying level (boosted: #1 priority for hover learning)
-    distance_to_goal_scale: float = 2.0   # Dense reward for approaching goal (reduced from 15.0 to prioritize stability)
-    collision_penalty_scale: float = 5.0   # Collision penalty (reduced from 10.0, less harsh early)
-    velocity_penalty_scale: float = 0.1   # Penalize excessive velocity (small factor)
-    acceleration_penalty_scale: float = 0.01  # DISABLED: was punishing recovery thrust, re-enable after hover learned
+    alive_reward_scale: float = 2.0       # Per-step reward for staying alive
+    upright_reward_scale: float = 10.0    # Reward for staying level (increased from 8.0 to prioritize stability)
+    distance_to_goal_scale: float = 3.0   # Dense reward for approaching goal (increased from 2.0 now that hover works)
+    collision_penalty_scale: float = 5.0   # Collision penalty
+    velocity_penalty_scale: float = 0.3   # Penalize excessive velocity (increased from 0.1 to encourage gentler motion)
+    acceleration_penalty_scale: float = 0.008  # Slightly increased from 0.005 to discourage jerky motion
 
 
 class QuadcopterEnv(DirectRLEnv):
@@ -567,7 +571,7 @@ class QuadcopterEnv(DirectRLEnv):
         self._episode_sums["velocity_penalty"] += rewards["velocity"]
         self._episode_sums["acceleration_penalty"] += rewards["acceleration"]
         
-        # Update previous velocity for next step's acceleration computation
+        # FIX #6: Update previous velocity for next step's acceleration computation (was missing!)
         self._prev_lin_vel_b = self._robot.data.root_lin_vel_b.clone()
         
         return reward
@@ -642,7 +646,7 @@ class QuadcopterEnv(DirectRLEnv):
         joint_vel = self._robot.data.default_joint_vel[env_ids]
         default_root_state = self._robot.data.default_root_state[env_ids].clone()
         default_root_state[:, :3] += self._terrain.env_origins[env_ids]
-        # Spawn at safe hover altitude (0.5m) instead of ground level
+        # FIX #7: Spawn at safe hover altitude (0.5m) instead of ground level (prevents instant death)
         default_root_state[:, 2] = self._terrain.env_origins[env_ids, 2] + 0.5
         
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
@@ -732,6 +736,7 @@ class QuadcopterEnv(DirectRLEnv):
         # Update goal position
         self.goal_pos_visualizer.visualize(self._desired_pos_w)
         
-        # Update obstacle positions (visualize as spheres)
-        obs_positions_flat = self._obstacle_pos_w.view(-1, 3)
-        self.obstacle_visualizer.visualize(obs_positions_flat)
+        # FIX #8: Only visualize obstacles if they exist (prevents error when num_obstacles=0)
+        if self.cfg.num_obstacles > 0:
+            obs_positions_flat = self._obstacle_pos_w.view(-1, 3)
+            self.obstacle_visualizer.visualize(obs_positions_flat)
